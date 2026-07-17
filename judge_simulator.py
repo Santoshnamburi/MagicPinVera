@@ -68,8 +68,8 @@ DATASET_DIR = Path(__file__).parent / "dataset"
 # Gemini free-tier quotas in the challenge environment are commonly 5 RPM / 20
 # RPD. The old simulator made a probe plus a burst of scoring calls, which
 # guaranteed 429s. Set the interval to 0 only for an unlimited/local provider.
-_default_interval = "12.5" if LLM_PROVIDER == "gemini" else "0"
-LLM_MIN_INTERVAL_SECONDS = float(os.getenv("LLM_MIN_INTERVAL_SECONDS", _default_interval))
+_default_interval = "12" if LLM_PROVIDER == "gemini" else "0"
+LLM_MIN_INTERVAL_SECONDS = os.getenv("LLM_MIN_INTERVAL_SECONDS", _default_interval)
 # Keep one request in reserve for provider-side/account-level traffic.
 LLM_MAX_REQUESTS_PER_RUN = int(os.getenv("LLM_MAX_REQUESTS_PER_RUN", "19"))
 LLM_DAILY_REQUEST_LIMIT = int(os.getenv("LLM_DAILY_REQUEST_LIMIT", "19"))
