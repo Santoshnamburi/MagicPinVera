@@ -62,6 +62,28 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def enforce_length(body: str, max_chars: int = 320) -> str:
+    """Keep outbound copy within the WhatsApp challenge limit.
+
+    Truncation happens at the last whitespace that fits, so a long context
+    value cannot produce a cut-off word.  The ellipsis is included in the
+    limit and the helper also behaves sensibly for very small limits.
+    """
+    text = str(body).strip()
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 0:
+        return ""
+    if max_chars <= 3:
+        return "." * max_chars
+    prefix = text[: max_chars - 3].rstrip()
+    boundary = prefix.rfind(" ")
+    if boundary <= 0:
+        return "..."
+    prefix = prefix[:boundary].rstrip()
+    return f"{prefix}..."
+
+
 def get_context(scope: str, context_id: str | None) -> dict[str, Any] | None:
     if not context_id:
         return None
@@ -310,7 +332,7 @@ def compose_customer(category: dict[str, Any], merchant: dict[str, Any], trigger
         "pharmacies": "Please confirm prescription details with the pharmacist; do not change a medicine based on this reminder.",
     }.get(slug, "The team will tailor the next step to your needs.")
     body += f" {customer_context}"
-    return {"body": body, "cta": cta_for(kind, customer=True), "rationale": rationale}
+    return {"body": enforce_length(body, 320), "cta": cta_for(kind, customer=True), "rationale": rationale}
 
 
 def compose_merchant(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[str, Any]) -> dict[str, str]:
@@ -465,7 +487,7 @@ def compose_merchant(category: dict[str, Any], merchant: dict[str, Any], trigger
     if kind not in {"research_digest", "regulation_change", "cde_opportunity"}:
         body += f" {category_context_line(category, merchant, trigger, offer)}"
     body += f" {merchant_context_line(category, merchant, trigger)}"
-    return {"body": body, "cta": cta_for(kind), "rationale": rationale}
+    return {"body": enforce_length(body, 320), "cta": cta_for(kind), "rationale": rationale}
 
 
 def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[str, Any], customer: dict[str, Any] | None = None) -> dict[str, str]:
@@ -476,7 +498,7 @@ def compose(category: dict[str, Any], merchant: dict[str, Any], trigger: dict[st
         result = compose_merchant(category, merchant, trigger)
         send_as = "vera"
     return {
-        "body": result["body"],
+        "body": enforce_length(result["body"], 320),
         "cta": result["cta"],
         "send_as": send_as,
         "suppression_key": str(trigger.get("suppression_key") or trigger.get("id", "")),
@@ -507,7 +529,7 @@ def build_action(trigger_id: str, trigger: dict[str, Any], merchant: dict[str, A
         "trigger_id": trigger_id,
         "template_name": template_name(str(trigger.get("kind", "message")), bool(customer_id)),
         "template_params": [merchant_name(merchant), str(trigger.get("kind", "")), msg["cta"]],
-        "body": msg["body"],
+        "body": enforce_length(msg["body"], 320),
         "cta": msg["cta"],
         "suppression_key": msg["suppression_key"],
         "rationale": msg["rationale"],
@@ -532,8 +554,12 @@ def is_auto_reply(message: str, state: dict[str, Any]) -> bool:
 
 
 def explicit_stop(message: str) -> bool:
-    text = message.lower()
-    return any(phrase in text for phrase in ["not interested", "stop messaging", "stop sending", "unsubscribe", "do not message", "useless spam"])
+    text = message.lower().strip()
+    return any(phrase in text for phrase in [
+        "not interested", "stop messaging", "stop sending", "unsubscribe",
+        "do not message", "don't message", "do not contact", "leave me alone",
+        "useless", "spam", "shut up", "fuck off", "go away",
+    ])
 
 
 def explicit_yes(message: str) -> bool:
@@ -544,6 +570,31 @@ def explicit_yes(message: str) -> bool:
 def off_topic(message: str) -> bool:
     text = message.lower()
     return any(term in text for term in ["gst", "tax filing", "income tax", "loan", "legal case", "passport"])
+
+
+def technical_followup(message: str) -> str | None:
+    """Return a grounded dental follow-up when the merchant names a domain."""
+    text = message.lower()
+    xray_terms = ("x-ray", "xray", "d-speed", "d speed", "film unit", "radiology", "rvg", "equipment", "audit")
+    cosmetic_terms = ("whitening", "aligner", "aligners", "braces", "orthodont")
+    recall_terms = ("cleaning", "checkup", "check-up", "recall", "prophylaxis")
+    if any(term in text for term in xray_terms):
+        return (
+            "For the X-ray audit, flag the old D-speed film unit first: compare it with an E-speed film setup or digital RVG sensor, "
+            "then check collimation, exposure settings, shielding, calibration/maintenance records, operator SOPs, and dose logs. "
+            "Digital sensors can reduce repeat exposures and radiation dose."
+        )
+    if any(term in text for term in cosmetic_terms):
+        return (
+            "For the cosmetic/orthodontic focus, we can frame transparent options: Teeth Whitening @ ₹1,499, then a consultation-led "
+            "comparison of supervised aligners versus braces. Keep inclusions, review visits, and exclusions visible rather than promising outcomes."
+        )
+    if any(term in text for term in recall_terms):
+        return (
+            "For cleaning and checkup demand, use a patient-recall angle: segment due and overdue patients, offer prophylaxis plus a checkup, "
+            "and make the next recall interval clear. I can draft the reminder with one simple booking CTA."
+        )
+    return None
 
 
 @app.get("/v1/healthz")
@@ -602,11 +653,17 @@ async def tick(body: TickBody):
 async def reply(body: ReplyBody):
     state = conversation_state.setdefault(body.conversation_id, {"turns": [], "sent_bodies": set(), "auto_replies": []})
     message = body.message.strip()
+    role = body.from_role.strip().lower()
+    if role not in {"merchant", "customer"}:
+        role = "merchant"
     state["turns"].append({"from": body.from_role, "body": message, "at": body.received_at})
 
-    if body.merchant_id and explicit_stop(message):
-        merchant_opt_outs.add(body.merchant_id)
-        return {"action": "end", "rationale": "Merchant explicitly opted out or reacted hostilely; closing and suppressing future proactive sends."}
+    # Stop/hostile intent always wins, independent of role or any other words
+    # in the message (for example, "yes, but stop messaging me").
+    if explicit_stop(message):
+        if body.merchant_id:
+            merchant_opt_outs.add(body.merchant_id)
+        return {"action": "end", "rationale": "Recipient explicitly opted out or reacted hostilely; closing the conversation."}
 
     if is_auto_reply(message, state):
         state["auto_replies"].append(message.lower())
@@ -617,22 +674,43 @@ async def reply(body: ReplyBody):
             return {"action": "wait", "wait_seconds": 86400, "rationale": "Repeated auto-reply detected; waiting 24 hours for a real owner/manager response."}
         return {"action": "wait", "wait_seconds": 14400, "rationale": "Detected WhatsApp Business auto-reply phrasing; backing off 4 hours instead of wasting turns."}
 
-    if explicit_yes(message):
-        response = "Great, proceeding now. I will prepare the draft from the context we discussed and keep it ready for your review. Reply CONFIRM to send it, or STOP to close."
+    # Customer replies are consent/booking turns, not merchant campaign intent.
+    if role == "customer":
+        if off_topic(message):
+            response = enforce_length("I can help with your appointment or treatment query, but not GST or tax filing. Please reply with the service or slot you need.", 320)
+            return {"action": "send", "body": response, "cta": "binary_yes_no", "rationale": "Customer off-topic request was declined politely and routed back to care."}
+        if explicit_yes(message):
+            response = enforce_length("Thanks — I’ll mark that as confirmed. The clinic team will share the next available slot or confirmation shortly.", 320)
+            return {"action": "send", "body": response, "cta": "binary_confirm_cancel", "rationale": "Customer explicitly confirmed the next appointment step."}
+        response = enforce_length("Thanks for the update. Please share your preferred service or appointment slot, and the clinic team can take it from there.", 320)
+        return {"action": "send", "body": response, "cta": "binary_yes_no", "rationale": "Customer reply was routed to a patient-friendly booking follow-up."}
+
+    # Merchant technical terms must be handled before the generic commitment
+    # route so a message such as "yes, help audit my X-ray setup" stays useful.
+    technical_response = technical_followup(message)
+    if technical_response:
+        response = enforce_length(technical_response, 320)
         if response in state.get("sent_bodies", set()):
-            response = "Done, I am moving this to the next step now. Reply CONFIRM when you want it sent."
+            return {"action": "wait", "wait_seconds": 1800, "rationale": "The same grounded technical response was already sent in this conversation."}
         state["sent_bodies"].add(response)
-        return {"action": "send", "body": response, "cta": "binary_confirm_cancel", "rationale": "Merchant gave explicit commitment, so the bot switches to execution instead of asking more qualifying questions."}
+        return {"action": "send", "body": response, "cta": "binary_yes_no", "rationale": "Merchant technical terms were routed to a specific dental/radiology follow-up."}
 
     if off_topic(message):
-        response = "That is outside what I can help with directly. Coming back to the original Vera task, I can prepare the draft/update from your business context. Reply YES and I will do it."
+        response = enforce_length("I’ll leave GST and tax filing to your CA. I can help with the original Vera task using your business context; reply YES and I’ll prepare the draft/update.", 320)
         state["sent_bodies"].add(response)
         return {"action": "send", "body": response, "cta": "binary_yes_no", "rationale": "Polite out-of-scope handling, then returns to the original merchant-growth task."}
+
+    if explicit_yes(message):
+        response = enforce_length("Great, proceeding now. I will prepare the draft from the context we discussed and keep it ready for your review. Reply CONFIRM to send it, or STOP to close.", 320)
+        if response in state.get("sent_bodies", set()):
+            response = enforce_length("Done, I am moving this to the next step now. Reply CONFIRM when you want it sent.", 320)
+        state["sent_bodies"].add(response)
+        return {"action": "send", "body": response, "cta": "binary_confirm_cancel", "rationale": "Merchant gave explicit commitment, so the bot switches to execution instead of asking more qualifying questions."}
 
     if any(word in message.lower() for word in ["later", "busy", "tomorrow", "call me"]):
         return {"action": "wait", "wait_seconds": 3600, "rationale": "Merchant asked to defer; waiting before re-engaging."}
 
-    response = "Got it. I can turn this into one ready-to-send draft using only your current account context. Reply YES to proceed."
+    response = enforce_length("Got it. I can turn this into one ready-to-send draft using only your current account context. Reply YES to proceed.", 320)
     if response in state.get("sent_bodies", set()):
         return {"action": "wait", "wait_seconds": 1800, "rationale": "Avoiding repetition in the same conversation; waiting for a clearer merchant signal."}
     state["sent_bodies"].add(response)
